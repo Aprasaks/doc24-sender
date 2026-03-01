@@ -3,31 +3,34 @@ from playwright.sync_api import sync_playwright
 import time
 import os
 import sys
-import subprocess
 from multiprocessing import freeze_support
-
-# 🚀 브라우저 엔진 자동 설치 함수
-def install_browser():
-    print("🌐 시스템 환경을 점검하고 브라우저 엔진을 확인합니다...")
-    try:
-        # EXE 실행 시 자기 자신을 다시 부르지 않도록 subprocess로 분리해서 실행
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        print(f"⚠️ 브라우저 설치 시도 중 참고사항: {e}")
 
 def run_macro():
     # 1. 엑셀 로드
     file_name = 'school_list.xlsx'
     if not os.path.exists(file_name):
-        print(f"❌ '{file_name}' 파일이 없습니다. 엑셀 파일을 넣어줘 형!")
+        print(f"❌ '{file_name}' 파일이 없습니다. 엑셀 파일을 프로그램 옆에 넣어주세요!")
         time.sleep(5)
         return
 
-    df = pd.read_excel(file_name)
-    df.columns = df.columns.str.strip() 
+    try:
+        df = pd.read_excel(file_name)
+        df.columns = df.columns.str.strip() 
+    except Exception as e:
+        print(f"❌ 엑셀 파일을 읽는 중 오류 발생: {e}")
+        time.sleep(5)
+        return
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        # 💡 브라우저 실행 (이미 설치되어 있어야 함)
+        try:
+            browser = p.chromium.launch(headless=False)
+        except Exception as e:
+            print("❌ 브라우저 엔진을 찾을 수 없습니다. 'playwright install chromium'을 먼저 실행해주세요.")
+            print(f"오류 내용: {e}")
+            time.sleep(10)
+            return
+            
         page = browser.new_page()
 
         # 2. 법인 로그인
@@ -52,7 +55,7 @@ def run_macro():
                 page.wait_for_load_state("networkidle")
                 time.sleep(3) 
 
-                # 4. 최신 문서 선택
+                # 4. 최신 문서 선택 (텍스트 방식)
                 try:
                     page.get_by_text("2026년 교직원 응급처치 교육").first.click(force=True)
                 except:
@@ -77,7 +80,7 @@ def run_macro():
                     time.sleep(2)
                 except: pass
 
-                # 7. 수신처 검색 및 충청남도 선택
+                # 7. 수신처 검색 및 충청남도 선택 (정밀 타격)
                 page.click("#ldapSearch")
                 time.sleep(2.5)
                 search_box = page.locator("#searchOrgNm")
@@ -97,7 +100,7 @@ def run_macro():
                     else: 
                         raise Exception("검색 결과에 충청남도/충남 없음")
                 except Exception as e:
-                    print(f"⚠️ {school_name} 충남 지역 검색 실패: {e}")
+                    print(f"⚠️ {school_name} 검색 실패 또는 타지역: {e}")
                     page.keyboard.press("Escape")
                     time.sleep(1)
                     continue
@@ -133,8 +136,6 @@ def run_macro():
 
         browser.close()
 
-# 💡 [핵심] 윈도우 EXE 실행 시 무한 루프를 방지하는 시작점
 if __name__ == "__main__":
-    freeze_support()    # 윈도우 멀티프로세싱 지원 (무한 실행 방지)
-    install_browser()   # 브라우저 설치 시도
-    run_macro()         # 매크로 실행
+    freeze_support() # 윈도우 환경 안전 장치
+    run_macro()
