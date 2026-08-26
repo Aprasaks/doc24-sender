@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from getpass import getpass
@@ -233,37 +234,29 @@ class Doc24Automation:
 
         log("문서24 로그인 페이지 이동")
         page.goto(DOC24_HOME)
-
         log("로그인 메뉴 선택")
         page.get_by_text("로그인", exact=True).click()
         page.wait_for_timeout(2000)
-
         log("법인 계정 선택")
         page.click("#entrprsHref")
-
         log("아이디 입력")
         page.fill("#id", username)
-
         log("비밀번호 입력")
         page.click("#password")
         page.keyboard.type(password, delay=100)
-
         log("로그인 실행")
         page.press("#password", "Enter")
         page.wait_for_timeout(5000)
 
         if "로그아웃" not in page.content():
             raise RuntimeError("문서24 로그인 실패")
-
         log("로그인 성공")
 
     def _find_latest_document_link(self):
         assert self.page is not None
-        page = self.page
-        rows = page.locator("tbody tr")
+        rows = self.page.locator("tbody tr")
         for index in range(rows.count()):
-            row = rows.nth(index)
-            links = row.locator("a")
+            links = rows.nth(index).locator("a")
             if links.count() == 0:
                 continue
             link = links.first
@@ -285,7 +278,6 @@ class Doc24Automation:
         except Exception:
             pass
         page.wait_for_timeout(3000)
-
         _, title = self._find_latest_document_link()
         return title
 
@@ -306,7 +298,6 @@ class Doc24Automation:
 
         page.locator("button:has-text('재작성')").click(force=True)
         page.wait_for_timeout(2000)
-
         page.evaluate("""
             const btn = Array.from(document.querySelectorAll('button.btnSkyBlue'))
                 .find(b => b.innerText.trim() === '예');
@@ -330,12 +321,10 @@ class Doc24Automation:
 
         page.click("#ldapSearch")
         page.wait_for_timeout(2500)
-
         search_box = page.locator("#searchOrgNm")
         search_box.click()
         search_box.fill("")
         page.keyboard.type(school_name, delay=150)
-
         page.click("button[type='submit']")
         page.wait_for_timeout(3000)
 
@@ -361,21 +350,40 @@ class Doc24Automation:
 
         raise RuntimeError("검색 결과에서 전북 기관을 찾지 못했습니다.")
 
-    def _click_required_button(self, selectors: list[str], label: str) -> None:
+    def _click_text_anywhere(self, text: str, label: str, timeout_ms: int = 8000) -> None:
+        """현재 페이지/iframe에서 보이는 정확한 텍스트 버튼을 찾아 클릭한다."""
         assert self.page is not None
         page = self.page
+        deadline = time.monotonic() + timeout_ms / 1000
 
-        for selector in selectors:
-            buttons = page.locator(selector)
-            for index in range(buttons.count() - 1, -1, -1):
-                button = buttons.nth(index)
-                try:
-                    if button.is_visible(timeout=800):
-                        button.click(force=True)
-                        log(f"{label} 클릭 완료")
-                        return
-                except Exception:
-                    continue
+        while time.monotonic() < deadline:
+            scopes = [page, *page.frames]
+            for scope in scopes:
+                candidates = [
+                    scope.get_by_role("button", name=text, exact=True),
+                    scope.locator(f"button:has-text('{text}')"),
+                    scope.locator(f"a:has-text('{text}')"),
+                    scope.locator(f"input[type='button'][value='{text}']"),
+                    scope.locator(f"input[type='submit'][value='{text}']"),
+                    scope.get_by_text(text, exact=True),
+                ]
+
+                for locator in candidates:
+                    try:
+                        count = locator.count()
+                    except Exception:
+                        continue
+                    for index in range(count - 1, -1, -1):
+                        target = locator.nth(index)
+                        try:
+                            if target.is_visible(timeout=300):
+                                target.click(force=True)
+                                log(f"{label} 클릭 완료")
+                                return
+                        except Exception:
+                            continue
+
+            page.wait_for_timeout(250)
 
         raise RuntimeError(f"{label} 버튼을 찾지 못했습니다.")
 
@@ -391,31 +399,18 @@ class Doc24Automation:
 
             log(f"최종 발송 중: {school_name}")
 
-            # 원래 동작하던 방식 그대로: 버튼이 실제 클릭 가능한 상태가 될 때까지 Playwright가 기다린다.
+            # 1단계: 작성 화면의 전송요청
             page.click("#sendDoc")
-            log("1단계 발송 버튼 클릭 완료")
-            page.wait_for_timeout(2000)
+            log("1단계 전송요청 클릭 완료")
+            page.wait_for_timeout(1200)
 
-            # 1단계 클릭 뒤 확인 모달이 실제로 떠야 한다.
-            page.wait_for_selector(".jconfirm-buttons button", state="visible", timeout=5000)
+            # 2단계: 현재 문서24 미리보기 팝업의 파란 '보내기'
+            # 예전 .jconfirm-buttons 구조를 가정하지 않는다.
+            self._click_text_anywhere("보내기", "2단계 보내기")
+            page.wait_for_timeout(1500)
 
-            self._click_required_button(
-                [
-                    ".jconfirm-buttons button:has-text('보내기')",
-                    "button:has-text('보내기')",
-                ],
-                "2단계 보내기",
-            )
-            page.wait_for_timeout(2000)
-
-            self._click_required_button(
-                [
-                    "button.btnSkyBlue:has-text('예')",
-                    ".jconfirm-buttons button:has-text('예')",
-                    "button:has-text('예')",
-                ],
-                "3단계 최종 예",
-            )
+            # 3단계: 최종 확인 '예'
+            self._click_text_anywhere("예", "3단계 최종 예")
             page.wait_for_timeout(3000)
 
             return RecipientResult(school_name, "완료")
