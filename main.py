@@ -361,6 +361,24 @@ class Doc24Automation:
 
         raise RuntimeError("검색 결과에서 전북 기관을 찾지 못했습니다.")
 
+    def _click_required_button(self, selectors: list[str], label: str) -> None:
+        assert self.page is not None
+        page = self.page
+
+        for selector in selectors:
+            buttons = page.locator(selector)
+            for index in range(buttons.count() - 1, -1, -1):
+                button = buttons.nth(index)
+                try:
+                    if button.is_visible(timeout=800):
+                        button.click(force=True)
+                        log(f"{label} 클릭 완료")
+                        return
+                except Exception:
+                    continue
+
+        raise RuntimeError(f"{label} 버튼을 찾지 못했습니다.")
+
     def resend_to(self, school_name: str, dry_run: bool) -> RecipientResult:
         assert self.page is not None
         page = self.page
@@ -372,32 +390,30 @@ class Doc24Automation:
                 return RecipientResult(school_name, "테스트", "수신처 선택 성공")
 
             log(f"최종 발송 중: {school_name}")
-            page.click("#sendDoc")
+
+            page.locator("#sendDoc").click(force=True)
+            log("1단계 발송 버튼 클릭 완료")
             page.wait_for_timeout(2000)
 
-            try:
-                page.wait_for_selector(".jconfirm-buttons button", state="visible", timeout=5000)
-                page.evaluate("""
-                    const buttons = Array.from(document.querySelectorAll('.jconfirm-buttons button'));
-                    const btn = buttons.find(b => b.innerText.trim() === '보내기');
-                    if (btn) btn.click();
-                """)
-            except Exception:
-                page.keyboard.press("Enter")
-
+            self._click_required_button(
+                [
+                    ".jconfirm-buttons button:has-text('보내기')",
+                    "button:has-text('보내기')",
+                ],
+                "2단계 보내기",
+            )
             page.wait_for_timeout(2000)
 
-            try:
-                page.wait_for_selector("button.btnSkyBlue", state="visible", timeout=5000)
-                page.evaluate("""
-                    const buttons = Array.from(document.querySelectorAll('button.btnSkyBlue'));
-                    const btn = buttons.find(b => b.innerText.trim() === '예');
-                    if (btn) btn.click();
-                """)
-            except Exception:
-                page.keyboard.press("Enter")
-
+            self._click_required_button(
+                [
+                    "button.btnSkyBlue:has-text('예')",
+                    ".jconfirm-buttons button:has-text('예')",
+                    "button:has-text('예')",
+                ],
+                "3단계 최종 예",
+            )
             page.wait_for_timeout(3000)
+
             return RecipientResult(school_name, "완료")
         except Exception as exc:
             try:
