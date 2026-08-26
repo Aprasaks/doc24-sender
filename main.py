@@ -19,7 +19,12 @@ SENT_DOCS_URL = "https://docu.gdoc.go.kr/doc/snd/sendDocList.do"
 
 APP_DIR = Path.home() / ".doc24_sender"
 CONFIG_PATH = APP_DIR / "config.json"
-RESULT_DIR = APP_DIR / "results"
+PROGRAM_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+RESULT_DIR = PROGRAM_DIR / "results"
 
 CHROME_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -43,6 +48,15 @@ def log(message: str) -> None:
 def ensure_dirs() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def create_result_paths() -> tuple[Path, Path]:
+    ensure_dirs()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        RESULT_DIR / f"문서24_발송결과_{stamp}.csv",
+        RESULT_DIR / f"문서24_반송목록_{stamp}.csv",
+    )
 
 
 def load_recipients() -> list[str]:
@@ -78,11 +92,12 @@ def load_recipients() -> list[str]:
     return recipients
 
 
-def save_results(results: list[RecipientResult]) -> tuple[Path, Path]:
+def save_results(
+    results: list[RecipientResult],
+    result_path: Path,
+    failed_path: Path,
+) -> None:
     ensure_dirs()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    result_path = RESULT_DIR / f"문서24_발송결과_{stamp}.csv"
-    failed_path = RESULT_DIR / f"문서24_반송목록_{stamp}.csv"
 
     with result_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
@@ -96,8 +111,6 @@ def save_results(results: list[RecipientResult]) -> tuple[Path, Path]:
         writer.writerow(["수신기관", "사유"])
         for result in failures:
             writer.writerow([result.recipient, result.reason])
-
-    return result_path, failed_path
 
 
 def load_local_credentials() -> tuple[str, str] | None:
@@ -452,6 +465,10 @@ class Doc24Automation:
 def run() -> int:
     recipients = load_recipients()
     dry_run = os.getenv("DOC24_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "y"}
+    result_path, failed_path = create_result_paths()
+    results: list[RecipientResult] = []
+    save_results(results, result_path, failed_path)
+    log(f"결과 저장 위치: {RESULT_DIR}")
 
     with PreventSleep(), Doc24Automation() as automation:
         automation.ensure_login()
@@ -468,13 +485,13 @@ def run() -> int:
                 print("취소했습니다.")
                 return 0
 
-        results: list[RecipientResult] = []
         total = len(recipients)
 
         for index, school_name in enumerate(recipients, start=1):
             log(f"[{index}/{total}] {school_name} 작업 시작")
             result = automation.resend_to(school_name, dry_run)
             results.append(result)
+            save_results(results, result_path, failed_path)
 
             if result.status == "실패":
                 log(f"반송/실패 기록: {school_name} - {result.reason}")
@@ -484,7 +501,6 @@ def run() -> int:
             else:
                 log(f"발송 완료: {school_name}")
 
-        result_path, failed_path = save_results(results)
         success = sum(1 for result in results if result.status != "실패")
         failed = sum(1 for result in results if result.status == "실패")
 
@@ -499,6 +515,8 @@ def run() -> int:
 
 def smoke_test() -> int:
     assert REGION_TERMS[0] == "전북특별자치도"
+    ensure_dirs()
+    assert RESULT_DIR.name == "results"
     sample = [
         RecipientResult("학교A", "완료"),
         RecipientResult("학교B", "실패", "검색 결과 없음"),
