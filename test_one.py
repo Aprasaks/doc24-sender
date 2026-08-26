@@ -21,6 +21,11 @@ def main() -> int:
             print(f"사유: {result.reason}")
 
         if result.status == "실패":
+            print("\n브라우저 화면을 확인해주세요.")
+            try:
+                input("확인 후 Enter를 누르면 종료합니다: ")
+            except Exception:
+                pass
             return 1
 
     return 0
