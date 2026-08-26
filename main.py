@@ -361,35 +361,82 @@ class Doc24Automation:
 
             log(f"최종 발송 중: {school_name}")
 
-            # 오늘 수정 전 마지막 코드(ea675a6)의 최종 발송 3단계 방식 복원
             page.click("#sendDoc")
             log("1단계 전송요청 클릭 완료")
-            page.wait_for_timeout(2000)
 
-            try:
-                page.wait_for_selector(".jconfirm-buttons button", state="visible", timeout=5000)
-                page.evaluate("""
-                    const modalBtns = Array.from(document.querySelectorAll('.jconfirm-buttons button'));
-                    const sendBtn = modalBtns.find(b => b.innerText.trim() === '보내기');
-                    if (sendBtn) sendBtn.click();
-                """)
-                log("2단계 보내기 클릭 완료")
-            except Exception:
-                page.keyboard.press("Enter")
-                log("2단계 보내기 Enter 대체 실행")
-            page.wait_for_timeout(2000)
+            page.wait_for_function("""
+                () => Array.from(document.querySelectorAll('button.btn.btnBlue')).some(b => {
+                    const text = (b.innerText || b.textContent || '').trim();
+                    const style = window.getComputedStyle(b);
+                    const rect = b.getBoundingClientRect();
+                    return text === '보내기'
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0
+                        && rect.width > 0
+                        && rect.height > 0;
+                })
+            """, timeout=8000)
 
-            try:
-                page.wait_for_selector("button.btnSkyBlue", state="visible", timeout=5000)
-                page.evaluate("""
-                    const finalBtns = Array.from(document.querySelectorAll('button.btnSkyBlue'));
-                    const yesBtn = finalBtns.find(b => b.innerText.trim() === '예');
-                    if (yesBtn) yesBtn.click();
-                """)
-                log("3단계 최종 예 클릭 완료")
-            except Exception:
-                page.keyboard.press("Enter")
-                log("3단계 최종 예 Enter 대체 실행")
+            send_clicked = page.evaluate("""
+                () => {
+                    const buttons = Array.from(document.querySelectorAll('button.btn.btnBlue'));
+                    const sendBtn = buttons.find(b => {
+                        const text = (b.innerText || b.textContent || '').trim();
+                        const style = window.getComputedStyle(b);
+                        const rect = b.getBoundingClientRect();
+                        return text === '보내기'
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || 1) > 0
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+                    if (!sendBtn) return false;
+                    sendBtn.click();
+                    return true;
+                }
+            """)
+            if not send_clicked:
+                raise RuntimeError("보이는 '보내기' 버튼 클릭 실패")
+            log("2단계 보내기 클릭 완료")
+
+            page.wait_for_function("""
+                () => Array.from(document.querySelectorAll('button.btn.btnSkyBlue')).some(b => {
+                    const text = (b.innerText || b.textContent || '').trim();
+                    const style = window.getComputedStyle(b);
+                    const rect = b.getBoundingClientRect();
+                    return text === '예'
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0
+                        && rect.width > 0
+                        && rect.height > 0;
+                })
+            """, timeout=8000)
+
+            yes_clicked = page.evaluate("""
+                () => {
+                    const buttons = Array.from(document.querySelectorAll('button.btn.btnSkyBlue'));
+                    const yesBtn = buttons.find(b => {
+                        const text = (b.innerText || b.textContent || '').trim();
+                        const style = window.getComputedStyle(b);
+                        const rect = b.getBoundingClientRect();
+                        return text === '예'
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || 1) > 0
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+                    if (!yesBtn) return false;
+                    yesBtn.click();
+                    return true;
+                }
+            """)
+            if not yes_clicked:
+                raise RuntimeError("보이는 '예' 버튼 클릭 실패")
+            log("3단계 최종 예 클릭 완료")
 
             page.wait_for_timeout(3000)
             return RecipientResult(school_name, "완료")
