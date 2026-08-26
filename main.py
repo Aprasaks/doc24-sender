@@ -399,20 +399,20 @@ class Doc24Automation:
 
             log(f"최종 발송 중: {school_name}")
 
-            # 1단계: 작성 화면의 전송요청
             page.click("#sendDoc")
             log("1단계 전송요청 클릭 완료")
-            page.wait_for_timeout(1200)
 
-            # 2단계: 현재 문서24 미리보기 팝업의 파란 '보내기'
-            # 예전 .jconfirm-buttons 구조를 가정하지 않는다.
-            self._click_text_anywhere("보내기", "2단계 보내기")
-            page.wait_for_timeout(1500)
+            send_button = page.locator("button.btn.btnBlue:has-text('보내기')")
+            send_button.wait_for(state="visible", timeout=8000)
+            send_button.click()
+            log("2단계 보내기 클릭 완료")
 
-            # 3단계: 최종 확인 '예'
-            self._click_text_anywhere("예", "3단계 최종 예")
+            yes_button = page.locator("button.btn.btnSkyBlue:has-text('예')")
+            yes_button.wait_for(state="visible", timeout=8000)
+            yes_button.click()
+            log("3단계 최종 예 클릭 완료")
+
             page.wait_for_timeout(3000)
-
             return RecipientResult(school_name, "완료")
         except Exception as exc:
             try:
