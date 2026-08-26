@@ -1,25 +1,31 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
-import queue
+import re
 import subprocess
 import sys
-import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 from openpyxl import load_workbook
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
 DOC24_HOME = "https://docu.gdoc.go.kr/index.do"
 SENT_DOCS_URL = "https://docu.gdoc.go.kr/doc/snd/sendDocList.do"
-PROFILE_DIR = Path.home() / ".doc24_sender" / "chrome-profile"
-LOGIN_WAIT_SECONDS = 300
+
+APP_DIR = Path.home() / ".doc24_sender"
+PROFILE_DIR = APP_DIR / "chrome-profile"
+CONFIG_PATH = APP_DIR / "config.json"
+RESULT_DIR = APP_DIR / "results"
+
+CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+]
 
 
 @dataclass
@@ -29,197 +35,287 @@ class RecipientResult:
     reason: str = ""
 
 
+def log(message: str) -> None:
+    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+
+
+def ensure_app_dirs() -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def parse_recipients(text: str) -> list[str]:
     recipients: list[str] = []
     seen: set[str] = set()
     for raw in text.replace(",", "\n").splitlines():
-        name = raw.strip()
-        if name and name not in seen:
-            recipients.append(name)
-            seen.add(name)
+        value = raw.strip()
+        if value and value not in seen:
+            recipients.append(value)
+            seen.add(value)
     return recipients
 
 
-def load_recipient_file(path: str) -> list[str]:
-    suffix = Path(path).suffix.lower()
-    values: list[str] = []
+def load_recipients() -> list[str]:
+    candidates = [
+        Path("school_list.xlsx"),
+        Path("recipients.xlsx"),
+        Path("recipients.csv"),
+        Path("recipients.txt"),
+    ]
+    source = next((path for path in candidates if path.exists()), None)
+    if source is None:
+        raise FileNotFoundError(
+            "수신기관 파일이 없습니다.\n"
+            "프로젝트 폴더에 school_list.xlsx, recipients.xlsx, recipients.csv, recipients.txt 중 하나를 넣어주세요."
+        )
 
-    if suffix == ".csv":
-        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+    if source.suffix.lower() == ".txt":
+        names = parse_recipients(source.read_text(encoding="utf-8-sig"))
+    elif source.suffix.lower() == ".csv":
+        values: list[str] = []
+        with source.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.reader(handle):
-                if row and row[0].strip():
-                    values.append(row[0].strip())
-    elif suffix == ".xlsx":
-        workbook = load_workbook(path, read_only=True, data_only=True)
+                if row and str(row[0]).strip():
+                    values.append(str(row[0]).strip())
+        names = parse_recipients("\n".join(values))
+    else:
+        workbook = load_workbook(source, read_only=True, data_only=True)
         sheet = workbook.active
+        values = []
         for row in sheet.iter_rows(values_only=True):
             if row and row[0] is not None:
-                value = str(row[0]).strip()
-                if value:
-                    values.append(value)
+                values.append(str(row[0]).strip())
         workbook.close()
-    else:
-        raise ValueError("CSV 또는 XLSX 파일만 불러올 수 있습니다.")
+        names = parse_recipients("\n".join(values))
 
-    if values and values[0].replace(" ", "") in {"학교명", "기관명", "수신기관", "수신자"}:
-        values = values[1:]
-    return parse_recipients("\n".join(values))
+    if names and names[0].replace(" ", "") in {"학교명", "기관명", "수신기관", "수신자"}:
+        names = names[1:]
+
+    if not names:
+        raise RuntimeError(f"{source.name}에서 수신기관을 찾지 못했습니다.")
+
+    log(f"수신기관 {len(names)}개 로드: {source.name}")
+    return names
 
 
-def save_failures(results: list[RecipientResult]) -> Path | None:
-    failures = [result for result in results if result.status == "실패"]
-    if not failures:
-        return None
-
-    downloads = Path.home() / "Downloads"
-    output_dir = downloads if downloads.exists() else Path.home()
-    output = output_dir / f"문서24_실패목록_{datetime.now():%Y%m%d_%H%M%S}.csv"
+def save_results(results: list[RecipientResult]) -> Path:
+    ensure_app_dirs()
+    output = RESULT_DIR / f"문서24_발송결과_{datetime.now():%Y%m%d_%H%M%S}.csv"
     with output.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["수신기관", "상태", "사유"])
-        for item in failures:
+        for item in results:
             writer.writerow([item.recipient, item.status, item.reason])
     return output
 
 
-class Doc24Automation:
-    def __init__(self, log):
-        self.log = log
-        self.playwright: Playwright | None = None
-        self.context: BrowserContext | None = None
-        self.page: Page | None = None
-        self.caffeinate: subprocess.Popen | None = None
+def load_local_credentials() -> tuple[str, str] | None:
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", ""))
+        if username and password:
+            return username, password
+    except Exception:
+        return None
+    return None
+
+
+def save_local_credentials(username: str, password: str) -> None:
+    ensure_app_dirs()
+    CONFIG_PATH.write_text(
+        json.dumps({"username": username, "password": password}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def extract_legacy_credentials(source: str) -> tuple[str, str] | None:
+    id_patterns = [
+        r'page\.fill\(\s*["\']#id["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+        r'locator\(\s*["\']#id["\']\s*\)\.fill\(\s*["\']([^"\']+)["\']\s*\)',
+    ]
+    pw_patterns = [
+        r'page\.keyboard\.type\(\s*["\']([^"\']+)["\']',
+        r'locator\(\s*["\']#password["\']\s*\)\.fill\(\s*["\']([^"\']+)["\']\s*\)',
+        r'page\.fill\(\s*["\']#password["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
+    ]
+
+    username = next(
+        (match.group(1) for pattern in id_patterns if (match := re.search(pattern, source))),
+        None,
+    )
+    password = next(
+        (match.group(1) for pattern in pw_patterns if (match := re.search(pattern, source))),
+        None,
+    )
+
+    if username and password:
+        return username, password
+    return None
+
+
+def migrate_legacy_credentials() -> tuple[str, str] | None:
+    if CONFIG_PATH.exists():
+        return load_local_credentials()
+
+    legacy_sources: list[str] = []
+
+    for path in [Path("legacy_main.py"), Path("main_old.py"), Path("old_main.py")]:
+        if path.exists():
+            try:
+                legacy_sources.append(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    try:
+        completed = subprocess.run(
+            ["git", "show", "main:main.py"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if completed.stdout:
+            legacy_sources.append(completed.stdout)
+    except Exception:
+        pass
+
+    for source in legacy_sources:
+        credentials = extract_legacy_credentials(source)
+        if credentials:
+            save_local_credentials(*credentials)
+            log("기존 코드의 로그인 정보를 맥 로컬 설정으로 이전했습니다.")
+            return credentials
+
+    return None
+
+
+class PreventSleep:
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
 
     def __enter__(self):
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        self.playwright = sync_playwright().start()
-        chromium = self.playwright.chromium
-
-        chrome_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-        ]
-        executable = next((path for path in chrome_paths if os.path.exists(path)), None)
-        if not executable:
-            raise RuntimeError("Google Chrome을 찾을 수 없습니다. 맥에 Google Chrome을 설치해주세요.")
-
         try:
-            self.context = chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                executable_path=executable,
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-                args=["--no-first-run", "--no-default-browser-check"],
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "문서24 전용 Chrome을 실행할 수 없습니다. 이미 열려 있다면 닫고 다시 실행해주세요."
-            ) from exc
-
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-
-        # 자동화 중 맥이 잠자기 상태로 들어가지 않도록 유지한다.
-        try:
-            self.caffeinate = subprocess.Popen(
+            self.process = subprocess.Popen(
                 ["caffeinate", "-dimsu"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
         except Exception:
-            self.caffeinate = None
+            self.process = None
+        return self
 
+    def __exit__(self, exc_type, exc, tb):
+        if self.process is not None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except Exception:
+                self.process.kill()
+
+
+class Doc24Automation:
+    def __init__(self, logger: Callable[[str], None] = log):
+        self.log = logger
+        self.playwright: Playwright | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
+
+    def __enter__(self):
+        ensure_app_dirs()
+        self.playwright = sync_playwright().start()
+        chrome_path = next((path for path in CHROME_PATHS if Path(path).exists()), None)
+        if not chrome_path:
+            raise RuntimeError("Google Chrome을 찾지 못했습니다. /Applications에 Chrome을 설치해주세요.")
+
+        self.context = self.playwright.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            executable_path=chrome_path,
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-notifications"],
+        )
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.context:
+            if self.context is not None:
                 self.context.close()
         finally:
-            if self.playwright:
+            if self.playwright is not None:
                 self.playwright.stop()
-            if self.caffeinate:
-                self.caffeinate.terminate()
-                self.caffeinate = None
+
+    def _is_logged_in(self) -> bool:
+        assert self.page is not None
+        page = self.page
+        try:
+            page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1200)
+        except Exception:
+            return False
+        content = page.content()
+        return "로그아웃" in content and "보낸 문서" in content
 
     def ensure_login(self) -> None:
         assert self.page is not None
-        page = self.page
-        self.log("문서24 로그인 상태 확인 중...")
-
-        page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1400)
-        if "로그아웃" in page.content():
-            self.log("저장된 로그인 세션으로 접속했습니다.")
+        if self._is_logged_in():
+            self.log("저장된 문서24 로그인 세션 사용")
             return
 
-        self.log("로그인이 필요합니다. 열린 전용 Chrome에서 한 번만 로그인해주세요.")
-        page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(800)
+        credentials = load_local_credentials() or migrate_legacy_credentials()
+        page = self.page
 
-        try:
-            login_button = page.get_by_text("로그인", exact=True)
-            if login_button.count() and login_button.first.is_visible():
-                login_button.first.click()
-                page.wait_for_timeout(900)
-            corporate = page.locator("#entrprsHref")
-            if corporate.count() and corporate.is_visible():
-                corporate.click()
-        except Exception:
-            pass
-
-        deadline = time.monotonic() + LOGIN_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                if "로그아웃" in page.content():
-                    self.log("로그인 확인 완료. 다음 실행부터 이 로그인 상태를 재사용합니다.")
-                    return
-            except Exception:
-                pass
+        if credentials:
+            username, password = credentials
+            self.log("저장된 로컬 계정정보로 문서24 로그인 시도")
+            page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
+            page.get_by_text("로그인", exact=True).click()
             page.wait_for_timeout(1000)
+            page.locator("#entrprsHref").click()
+            page.locator("#id").fill(username)
+            page.locator("#password").fill(password)
+            page.locator("#password").press("Enter")
+            page.wait_for_timeout(3000)
 
-        raise RuntimeError("5분 안에 로그인이 확인되지 않았습니다. 다시 실행해주세요.")
+            if self._is_logged_in():
+                self.log("자동 로그인 성공")
+                return
+            self.log("자동 로그인 실패. 전용 Chrome에서 직접 로그인해주세요.")
+
+        page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
+        print("\n문서24 전용 Chrome에서 로그인해주세요.")
+        print("로그인 완료 후 이 터미널로 돌아와 Enter를 누르세요.\n")
+        input()
+        if not self._is_logged_in():
+            raise RuntimeError("문서24 로그인 상태를 확인하지 못했습니다.")
+        self.log("로그인 확인 완료. 다음 실행부터 이 Chrome 세션을 재사용합니다.")
 
     def get_last_document_title(self) -> str:
         assert self.page is not None
         page = self.page
         page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1800)
+        page.wait_for_timeout(1300)
+
         row = page.locator("tbody tr").first
         if row.count() == 0:
-            raise RuntimeError("보낸 문서함에서 마지막 문서를 찾지 못했습니다.")
+            raise RuntimeError("보낸 문서함에서 마지막 전송문서를 찾지 못했습니다.")
+
         link = row.locator("a").first
         if link.count() == 0:
             raise RuntimeError("마지막 전송문서 링크를 찾지 못했습니다.")
+
         title = link.inner_text().strip()
         if not title:
             title = row.inner_text().strip().splitlines()[0]
         return title
-
-    def _open_last_document_for_rewrite(self) -> None:
-        assert self.page is not None
-        page = self.page
-        page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1400)
-        page.locator("tbody tr").first.locator("a").first.click(force=True)
-        page.wait_for_timeout(1600)
-        page.locator("button:has-text('재작성')").click(force=True)
-        page.wait_for_timeout(700)
-        self._click_dialog_button("예")
-        page.wait_for_timeout(1500)
-
-        for index in range(1, 5):
-            locator = page.locator(f"label[for='wteChk{index}']")
-            if locator.count() and locator.is_visible():
-                locator.click()
-                page.wait_for_timeout(120)
-
-        confirm = page.get_by_role("button", name="확인")
-        if confirm.count() and confirm.last.is_visible():
-            try:
-                confirm.last.click()
-                page.wait_for_timeout(700)
-            except Exception:
-                pass
 
     def _click_dialog_button(self, label: str) -> None:
         assert self.page is not None
@@ -231,62 +327,109 @@ class Doc24Automation:
         ]
         for locator in candidates:
             try:
-                if locator.count() and locator.last.is_visible(timeout=1000):
+                if locator.count() and locator.last.is_visible(timeout=1200):
                     locator.last.click(force=True)
                     return
             except Exception:
                 continue
-        raise RuntimeError(f"'{label}' 확인 버튼을 찾지 못했습니다.")
+        raise RuntimeError(f"'{label}' 버튼을 찾지 못했습니다.")
+
+    def _open_last_document_for_rewrite(self) -> None:
+        assert self.page is not None
+        page = self.page
+
+        page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1200)
+
+        row = page.locator("tbody tr").first
+        row.locator("a").first.click(force=True)
+        page.wait_for_timeout(1400)
+
+        rewrite_button = page.locator("button:has-text('재작성')")
+        if rewrite_button.count() == 0:
+            raise RuntimeError("재작성 버튼을 찾지 못했습니다.")
+        rewrite_button.first.click(force=True)
+        page.wait_for_timeout(600)
+        self._click_dialog_button("예")
+        page.wait_for_timeout(1200)
+
+        for index in range(1, 5):
+            checkbox = page.locator(f"label[for='wteChk{index}']")
+            try:
+                if checkbox.count() and checkbox.is_visible():
+                    checkbox.click()
+                    page.wait_for_timeout(120)
+            except Exception:
+                pass
+
+        confirm = page.get_by_role("button", name="확인")
+        try:
+            if confirm.count() and confirm.last.is_visible(timeout=700):
+                confirm.last.click()
+                page.wait_for_timeout(600)
+        except Exception:
+            pass
 
     def _select_recipient(self, recipient: str) -> None:
         assert self.page is not None
         page = self.page
+
         page.locator("#ldapSearch").click()
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(900)
+
         search_box = page.locator("#searchOrgNm")
         search_box.fill(recipient)
 
         search_button = page.get_by_role("button", name="검색")
-        if search_button.count() and search_button.last.is_visible():
+        if search_button.count():
             search_button.last.click()
         else:
             page.locator("button[type='submit']").last.click()
-        page.wait_for_timeout(1300)
+
+        page.wait_for_timeout(1200)
 
         rows = page.locator("tr:has(button:has-text('선택'))")
-        target = None
-        normalized_target = recipient.replace(" ", "")
+        normalized_target = re.sub(r"\s+", "", recipient)
+        exact_match = None
+        loose_match = None
+
         for index in range(rows.count()):
             row = rows.nth(index)
             try:
-                row_text = row.inner_text().replace(" ", "")
+                raw = row.inner_text()
             except Exception:
                 continue
-            if normalized_target in row_text:
-                target = row
-                break
+            normalized_row = re.sub(r"\s+", "", raw)
 
+            if normalized_target == normalized_row or normalized_row.startswith(normalized_target):
+                exact_match = row
+                break
+            if normalized_target in normalized_row and loose_match is None:
+                loose_match = row
+
+        target = exact_match or loose_match
         if target is None:
             raise RuntimeError("수신기관 검색 결과에서 일치하는 기관을 찾지 못했습니다.")
 
         target.get_by_role("button", name="선택").click()
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(500)
 
-    def resend_to(self, recipient: str, actual_send: bool) -> RecipientResult:
+    def resend_to(self, recipient: str, dry_run: bool) -> RecipientResult:
         assert self.page is not None
         page = self.page
         try:
             self._open_last_document_for_rewrite()
             self._select_recipient(recipient)
-            if not actual_send:
-                return RecipientResult(recipient, "테스트", "수신기관 검색/선택까지만 확인")
+
+            if dry_run:
+                return RecipientResult(recipient, "테스트", "수신기관 검색/선택 성공")
 
             page.locator("#sendDoc").click()
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(600)
             self._click_dialog_button("보내기")
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(600)
             self._click_dialog_button("예")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1400)
             return RecipientResult(recipient, "완료")
         except Exception as exc:
             try:
@@ -296,231 +439,70 @@ class Doc24Automation:
             return RecipientResult(recipient, "실패", str(exc))
 
 
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("문서24 재발송기")
-        self.root.geometry("780x650")
-        self.root.minsize(720, 580)
+def run() -> int:
+    ensure_app_dirs()
+    recipients = load_recipients()
+    dry_run = os.getenv("DOC24_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "y"}
 
-        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.preview_title = ""
-        self.running = False
+    with PreventSleep(), Doc24Automation() as automation:
+        automation.ensure_login()
+        last_title = automation.get_last_document_title()
 
-        self.actual_send = tk.BooleanVar(value=False)
-        self.preview_text = tk.StringVar(value="마지막 전송문서를 먼저 확인해주세요.")
-        self.status_text = tk.StringVar(value="대기 중")
+        print("\n" + "=" * 70)
+        print("마지막 전송문서")
+        print(last_title)
+        print(f"수신기관: {len(recipients)}개")
+        print("모드:", "테스트(실제 발송 안 함)" if dry_run else "실제 발송")
+        print("=" * 70)
 
-        self._build_ui()
-        self.root.after(100, self._poll_events)
+        if not dry_run:
+            answer = input("이 문서를 위 수신기관에 재발송할까요? [YES 입력]: ").strip()
+            if answer != "YES":
+                print("취소했습니다.")
+                return 0
+        else:
+            input("테스트를 시작하려면 Enter를 누르세요: ")
 
-    def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=20)
-        outer.pack(fill="both", expand=True)
-
-        ttk.Label(outer, text="문서24 재발송기", font=("Helvetica", 22, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="전용 Chrome 로그인 상태를 저장하고 마지막 전송문서를 여러 기관에 순차 재발송합니다.",
-        ).pack(anchor="w", pady=(4, 8))
-        ttk.Label(
-            outer,
-            text=f"로그인 프로필: {PROFILE_DIR}",
-            foreground="#666666",
-        ).pack(anchor="w", pady=(0, 14))
-
-        preview_frame = ttk.LabelFrame(outer, text="마지막 전송문서", padding=12)
-        preview_frame.pack(fill="x")
-        ttk.Label(preview_frame, textvariable=self.preview_text, wraplength=610).pack(side="left", fill="x", expand=True)
-        self.preview_button = ttk.Button(preview_frame, text="확인", command=self.preview_last_document)
-        self.preview_button.pack(side="right", padx=(12, 0))
-
-        recipients_frame = ttk.LabelFrame(outer, text="수신기관 (한 줄에 하나)", padding=12)
-        recipients_frame.pack(fill="both", expand=True, pady=(14, 0))
-        button_row = ttk.Frame(recipients_frame)
-        button_row.pack(fill="x", pady=(0, 8))
-        ttk.Button(button_row, text="CSV/XLSX 불러오기", command=self.import_recipients).pack(side="left")
-        ttk.Button(button_row, text="목록 비우기", command=lambda: self.recipients.delete("1.0", "end")).pack(side="left", padx=6)
-        self.recipients = tk.Text(recipients_frame, height=12, wrap="none")
-        self.recipients.pack(fill="both", expand=True)
-
-        options = ttk.Frame(outer)
-        options.pack(fill="x", pady=(14, 0))
-        ttk.Checkbutton(
-            options,
-            text="실제 발송 (체크하지 않으면 수신기관 검색/선택까지만 테스트)",
-            variable=self.actual_send,
-        ).pack(side="left")
-
-        action_row = ttk.Frame(outer)
-        action_row.pack(fill="x", pady=(12, 0))
-        self.start_button = ttk.Button(action_row, text="마지막 문서 재발송 시작", command=self.start_sending)
-        self.start_button.pack(side="left")
-        ttk.Label(action_row, textvariable=self.status_text).pack(side="right")
-
-        log_frame = ttk.LabelFrame(outer, text="진행 로그", padding=8)
-        log_frame.pack(fill="both", expand=True, pady=(14, 0))
-        self.log_box = tk.Text(log_frame, height=9, state="disabled", wrap="word")
-        self.log_box.pack(fill="both", expand=True)
-
-    def import_recipients(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("수신기관 목록", "*.csv *.xlsx")])
-        if not path:
-            return
-        try:
-            names = load_recipient_file(path)
-        except Exception as exc:
-            messagebox.showerror("불러오기 실패", str(exc))
-            return
-        self.recipients.delete("1.0", "end")
-        self.recipients.insert("1.0", "\n".join(names))
-        self._append_log(f"수신기관 {len(names)}개를 불러왔습니다.")
-
-    def preview_last_document(self) -> None:
-        if self.running:
-            return
-        self._set_running(True, "마지막 문서 확인 중")
-        threading.Thread(target=self._preview_worker, daemon=True).start()
-
-    def _preview_worker(self) -> None:
-        try:
-            with Doc24Automation(self._thread_log) as automation:
-                automation.ensure_login()
-                title = automation.get_last_document_title()
-            self.events.put(("preview", title))
-        except Exception as exc:
-            self.events.put(("error", str(exc)))
-        finally:
-            self.events.put(("idle", "대기 중"))
-
-    def start_sending(self) -> None:
-        if self.running:
-            return
-        if not self.preview_title:
-            messagebox.showwarning("마지막 문서 확인", "먼저 [확인]을 눌러 마지막 전송문서를 확인해주세요.")
-            return
-
-        recipients = parse_recipients(self.recipients.get("1.0", "end"))
-        if not recipients:
-            messagebox.showwarning("수신기관", "수신기관을 한 곳 이상 입력해주세요.")
-            return
-
-        mode = "실제 발송" if self.actual_send.get() else "테스트"
-        if self.actual_send.get():
-            answer = messagebox.askyesno(
-                "실제 발송 확인",
-                f"'{self.preview_title}' 문서를 {len(recipients)}개 기관에 실제 발송합니다.\n\n계속할까요?",
-            )
-            if not answer:
-                return
-
-        self._append_log(f"{mode} 시작: {len(recipients)}개 기관")
-        self._set_running(True, f"{mode} 진행 중")
-        threading.Thread(
-            target=self._send_worker,
-            args=(recipients, self.preview_title, self.actual_send.get()),
-            daemon=True,
-        ).start()
-
-    def _send_worker(
-        self,
-        recipients: list[str],
-        expected_title: str,
-        actual_send: bool,
-    ) -> None:
         results: list[RecipientResult] = []
-        try:
-            with Doc24Automation(self._thread_log) as automation:
-                automation.ensure_login()
-                current_title = automation.get_last_document_title()
-                if current_title != expected_title:
-                    raise RuntimeError(
-                        "마지막 전송문서가 확인했을 때와 달라졌습니다. 다시 [확인]을 눌러주세요.\n"
-                        f"확인 당시: {expected_title}\n현재: {current_title}"
-                    )
+        total = len(recipients)
 
-                total = len(recipients)
-                for index, recipient in enumerate(recipients, start=1):
-                    self._thread_log(f"[{index}/{total}] {recipient} 처리 중")
-                    result = automation.resend_to(recipient, actual_send)
-                    results.append(result)
-                    if result.status == "실패":
-                        self._thread_log(f"실패: {recipient} - {result.reason}")
-                    elif result.status == "테스트":
-                        self._thread_log(f"테스트 성공: {recipient}")
-                    else:
-                        self._thread_log(f"발송 완료: {recipient}")
+        for index, recipient in enumerate(recipients, start=1):
+            log(f"[{index}/{total}] {recipient} 처리 시작")
+            result = automation.resend_to(recipient, dry_run=dry_run)
+            results.append(result)
 
-            failure_file = save_failures(results)
-            failures = sum(1 for result in results if result.status == "실패")
-            completed = len(results) - failures
-            summary = f"처리 완료 {completed} / 실패 {failures}"
-            if failure_file:
-                summary += f"\n실패 목록: {failure_file}"
-            self.events.put(("done", summary))
-        except Exception as exc:
-            failure_file = save_failures(results)
-            message = str(exc)
-            if failure_file:
-                message += f"\n실패 목록: {failure_file}"
-            self.events.put(("error", message))
-        finally:
-            self.events.put(("idle", "대기 중"))
+            if result.status == "실패":
+                log(f"실패: {recipient} - {result.reason}")
+            elif result.status == "테스트":
+                log(f"테스트 성공: {recipient}")
+            else:
+                log(f"발송 완료: {recipient}")
 
-    def _thread_log(self, text: str) -> None:
-        self.events.put(("log", text))
+        output = save_results(results)
+        success = sum(1 for item in results if item.status in {"완료", "테스트"})
+        failed = sum(1 for item in results if item.status == "실패")
 
-    def _append_log(self, text: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{timestamp}] {text}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        print("\n" + "=" * 70)
+        print(f"처리 완료: {success} / 실패: {failed}")
+        print(f"결과 파일: {output}")
+        print("=" * 70)
 
-    def _set_running(self, running: bool, status: str) -> None:
-        self.running = running
-        self.status_text.set(status)
-        state = "disabled" if running else "normal"
-        self.preview_button.configure(state=state)
-        self.start_button.configure(state=state)
-
-    def _poll_events(self) -> None:
-        try:
-            while True:
-                event, payload = self.events.get_nowait()
-                if event == "log":
-                    self._append_log(str(payload))
-                elif event == "preview":
-                    self.preview_title = str(payload)
-                    self.preview_text.set(self.preview_title)
-                    self._append_log(f"마지막 전송문서 확인: {self.preview_title}")
-                elif event == "done":
-                    self._append_log(str(payload).replace("\n", " | "))
-                    messagebox.showinfo("완료", str(payload))
-                elif event == "error":
-                    self._append_log(f"오류: {payload}")
-                    messagebox.showerror("오류", str(payload))
-                elif event == "idle":
-                    self._set_running(False, str(payload))
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll_events)
+    return 0
 
 
 def smoke_test() -> int:
     assert parse_recipients("기관A\n기관B\n기관A") == ["기관A", "기관B"]
     assert parse_recipients("기관A, 기관B") == ["기관A", "기관B"]
-    assert PROFILE_DIR.name == "chrome-profile"
+
+    sample = 'page.fill("#id", "example-user")\npage.keyboard.type("example-password", delay=100)'
+    assert extract_legacy_credentials(sample) == ("example-user", "example-password")
     return 0
 
 
 def main() -> int:
     if "--smoke-test" in sys.argv:
         return smoke_test()
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
-    return 0
+    return run()
 
 
 if __name__ == "__main__":
