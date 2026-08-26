@@ -391,9 +391,13 @@ class Doc24Automation:
 
             log(f"최종 발송 중: {school_name}")
 
-            page.locator("#sendDoc").click(force=True)
+            # 원래 동작하던 방식 그대로: 버튼이 실제 클릭 가능한 상태가 될 때까지 Playwright가 기다린다.
+            page.click("#sendDoc")
             log("1단계 발송 버튼 클릭 완료")
             page.wait_for_timeout(2000)
+
+            # 1단계 클릭 뒤 확인 모달이 실제로 떠야 한다.
+            page.wait_for_selector(".jconfirm-buttons button", state="visible", timeout=5000)
 
             self._click_required_button(
                 [
