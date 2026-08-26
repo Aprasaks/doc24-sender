@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from getpass import getpass
@@ -350,43 +349,6 @@ class Doc24Automation:
 
         raise RuntimeError("검색 결과에서 전북 기관을 찾지 못했습니다.")
 
-    def _click_text_anywhere(self, text: str, label: str, timeout_ms: int = 8000) -> None:
-        """현재 페이지/iframe에서 보이는 정확한 텍스트 버튼을 찾아 클릭한다."""
-        assert self.page is not None
-        page = self.page
-        deadline = time.monotonic() + timeout_ms / 1000
-
-        while time.monotonic() < deadline:
-            scopes = [page, *page.frames]
-            for scope in scopes:
-                candidates = [
-                    scope.get_by_role("button", name=text, exact=True),
-                    scope.locator(f"button:has-text('{text}')"),
-                    scope.locator(f"a:has-text('{text}')"),
-                    scope.locator(f"input[type='button'][value='{text}']"),
-                    scope.locator(f"input[type='submit'][value='{text}']"),
-                    scope.get_by_text(text, exact=True),
-                ]
-
-                for locator in candidates:
-                    try:
-                        count = locator.count()
-                    except Exception:
-                        continue
-                    for index in range(count - 1, -1, -1):
-                        target = locator.nth(index)
-                        try:
-                            if target.is_visible(timeout=300):
-                                target.click(force=True)
-                                log(f"{label} 클릭 완료")
-                                return
-                        except Exception:
-                            continue
-
-            page.wait_for_timeout(250)
-
-        raise RuntimeError(f"{label} 버튼을 찾지 못했습니다.")
-
     def resend_to(self, school_name: str, dry_run: bool) -> RecipientResult:
         assert self.page is not None
         page = self.page
@@ -402,12 +364,16 @@ class Doc24Automation:
             page.click("#sendDoc")
             log("1단계 전송요청 클릭 완료")
 
-            send_button = page.locator("button.btn.btnBlue:has-text('보내기')")
+            send_button = page.locator(
+                "#jconfirm-buttons-top button.btn.btnBlue:has-text('보내기')"
+            ).first
             send_button.wait_for(state="visible", timeout=8000)
             send_button.click()
             log("2단계 보내기 클릭 완료")
 
-            yes_button = page.locator("button.btn.btnSkyBlue:has-text('예')")
+            yes_button = page.locator(
+                "#jconfirm-buttons-top button.btn.btnSkyBlue:has-text('예')"
+            ).first
             yes_button.wait_for(state="visible", timeout=8000)
             yes_button.click()
             log("3단계 최종 예 클릭 완료")
