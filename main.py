@@ -298,24 +298,97 @@ class Doc24Automation:
             raise RuntimeError("문서24 로그인 상태를 확인하지 못했습니다.")
         self.log("로그인 확인 완료. 다음 실행부터 이 Chrome 세션을 재사용합니다.")
 
+    def _save_last_document_debug(self, reason: str) -> Path:
+        assert self.page is not None
+        ensure_app_dirs()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = RESULT_DIR / f"last_document_debug_{stamp}"
+        try:
+            self.page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True)
+        except Exception:
+            pass
+        try:
+            prefix.with_suffix(".html").write_text(self.page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            prefix.with_suffix(".txt").write_text(reason, encoding="utf-8")
+        except Exception:
+            pass
+        return prefix
+
+    def _find_latest_document(self):
+        assert self.page is not None
+        page = self.page
+        rows = page.locator("tbody tr")
+        row_count = rows.count()
+        if row_count == 0:
+            debug = self._save_last_document_debug("tbody tr이 없습니다.")
+            raise RuntimeError(f"보낸 문서함에서 문서 행을 찾지 못했습니다. 디버그: {debug}")
+
+        row_logs: list[str] = []
+        for index in range(row_count):
+            row = rows.nth(index)
+            try:
+                row_text = " ".join(row.inner_text().split())
+            except Exception:
+                row_text = ""
+
+            if row_text:
+                row_logs.append(f"row {index}: {row_text[:300]}")
+
+            if not row_text:
+                continue
+            if any(message in row_text for message in ["조회된 데이터가 없습니다", "검색 결과가 없습니다"]):
+                continue
+
+            selectors = ["a", "button", "[onclick]", "[role='button']"]
+            for selector in selectors:
+                candidates = row.locator(selector)
+                for candidate_index in range(candidates.count()):
+                    candidate = candidates.nth(candidate_index)
+                    try:
+                        text = " ".join(candidate.inner_text().split())
+                    except Exception:
+                        text = ""
+                    try:
+                        visible = candidate.is_visible()
+                    except Exception:
+                        visible = False
+
+                    # 문서 제목은 보통 텍스트가 있는 클릭 요소다.
+                    if visible and text and text not in {"보기", "상세", "다운로드", "삭제"}:
+                        return row, candidate, text
+
+            # 행 자체에 onclick이 걸린 구조도 허용한다.
+            try:
+                if row.get_attribute("onclick"):
+                    return row, row, row_text
+            except Exception:
+                pass
+
+        # 클릭요소를 못 찾더라도 첫 번째 실제 데이터 행 텍스트는 진단에 남긴다.
+        reason = "\n".join(row_logs[:10]) or "행 텍스트도 읽지 못했습니다."
+        debug = self._save_last_document_debug(reason)
+        raise RuntimeError(
+            "마지막 전송문서의 클릭 요소를 찾지 못했습니다. "
+            f"디버그 파일이 저장되었습니다: {debug}"
+        )
+
     def get_last_document_title(self) -> str:
         assert self.page is not None
         page = self.page
         page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1300)
+        page.wait_for_timeout(1800)
 
-        row = page.locator("tbody tr").first
-        if row.count() == 0:
-            raise RuntimeError("보낸 문서함에서 마지막 전송문서를 찾지 못했습니다.")
+        row, target, title = self._find_latest_document()
+        if title:
+            return title
 
-        link = row.locator("a").first
-        if link.count() == 0:
-            raise RuntimeError("마지막 전송문서 링크를 찾지 못했습니다.")
-
-        title = link.inner_text().strip()
-        if not title:
-            title = row.inner_text().strip().splitlines()[0]
-        return title
+        row_text = " ".join(row.inner_text().split())
+        if row_text:
+            return row_text
+        raise RuntimeError("마지막 전송문서 제목을 읽지 못했습니다.")
 
     def _click_dialog_button(self, label: str) -> None:
         assert self.page is not None
@@ -339,19 +412,20 @@ class Doc24Automation:
         page = self.page
 
         page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1800)
 
-        row = page.locator("tbody tr").first
-        row.locator("a").first.click(force=True)
-        page.wait_for_timeout(1400)
+        _, target, _ = self._find_latest_document()
+        target.click(force=True)
+        page.wait_for_timeout(1600)
 
         rewrite_button = page.locator("button:has-text('재작성')")
         if rewrite_button.count() == 0:
-            raise RuntimeError("재작성 버튼을 찾지 못했습니다.")
+            debug = self._save_last_document_debug("문서 상세 진입 후 재작성 버튼이 없습니다.")
+            raise RuntimeError(f"재작성 버튼을 찾지 못했습니다. 디버그: {debug}")
         rewrite_button.first.click(force=True)
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(700)
         self._click_dialog_button("예")
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1400)
 
         for index in range(1, 5):
             checkbox = page.locator(f"label[for='wteChk{index}']")
@@ -375,7 +449,7 @@ class Doc24Automation:
         page = self.page
 
         page.locator("#ldapSearch").click()
-        page.wait_for_timeout(900)
+        page.wait_for_timeout(1000)
 
         search_box = page.locator("#searchOrgNm")
         search_box.fill(recipient)
@@ -386,7 +460,7 @@ class Doc24Automation:
         else:
             page.locator("button[type='submit']").last.click()
 
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1400)
 
         rows = page.locator("tr:has(button:has-text('선택'))")
         normalized_target = re.sub(r"\s+", "", recipient)
@@ -412,7 +486,7 @@ class Doc24Automation:
             raise RuntimeError("수신기관 검색 결과에서 일치하는 기관을 찾지 못했습니다.")
 
         target.get_by_role("button", name="선택").click()
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(600)
 
     def resend_to(self, recipient: str, dry_run: bool) -> RecipientResult:
         assert self.page is not None
@@ -425,11 +499,11 @@ class Doc24Automation:
                 return RecipientResult(recipient, "테스트", "수신기관 검색/선택 성공")
 
             page.locator("#sendDoc").click()
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(700)
             self._click_dialog_button("보내기")
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(700)
             self._click_dialog_button("예")
-            page.wait_for_timeout(1400)
+            page.wait_for_timeout(1600)
             return RecipientResult(recipient, "완료")
         except Exception as exc:
             try:
