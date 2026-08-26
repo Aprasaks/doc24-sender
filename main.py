@@ -361,22 +361,35 @@ class Doc24Automation:
 
             log(f"최종 발송 중: {school_name}")
 
+            # 오늘 수정 전 마지막 코드(ea675a6)의 최종 발송 3단계 방식 복원
             page.click("#sendDoc")
             log("1단계 전송요청 클릭 완료")
+            page.wait_for_timeout(2000)
 
-            send_button = page.locator(
-                "#jconfirm-buttons-top button.btn.btnBlue:has-text('보내기')"
-            ).first
-            send_button.wait_for(state="visible", timeout=8000)
-            send_button.click()
-            log("2단계 보내기 클릭 완료")
+            try:
+                page.wait_for_selector(".jconfirm-buttons button", state="visible", timeout=5000)
+                page.evaluate("""
+                    const modalBtns = Array.from(document.querySelectorAll('.jconfirm-buttons button'));
+                    const sendBtn = modalBtns.find(b => b.innerText.trim() === '보내기');
+                    if (sendBtn) sendBtn.click();
+                """)
+                log("2단계 보내기 클릭 완료")
+            except Exception:
+                page.keyboard.press("Enter")
+                log("2단계 보내기 Enter 대체 실행")
+            page.wait_for_timeout(2000)
 
-            yes_button = page.locator(
-                "#jconfirm-buttons-top button.btn.btnSkyBlue:has-text('예')"
-            ).first
-            yes_button.wait_for(state="visible", timeout=8000)
-            yes_button.click()
-            log("3단계 최종 예 클릭 완료")
+            try:
+                page.wait_for_selector("button.btnSkyBlue", state="visible", timeout=5000)
+                page.evaluate("""
+                    const finalBtns = Array.from(document.querySelectorAll('button.btnSkyBlue'));
+                    const yesBtn = finalBtns.find(b => b.innerText.trim() === '예');
+                    if (yesBtn) yesBtn.click();
+                """)
+                log("3단계 최종 예 클릭 완료")
+            except Exception:
+                page.keyboard.press("Enter")
+                log("3단계 최종 예 Enter 대체 실행")
 
             page.wait_for_timeout(3000)
             return RecipientResult(school_name, "완료")
