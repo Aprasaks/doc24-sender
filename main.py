@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from getpass import getpass
@@ -210,6 +209,10 @@ def get_credentials() -> tuple[str, str]:
     save_local_credentials(username, password)
     print("로그인 정보를 이 맥의 ~/.doc24_sender/config.json 에 저장했습니다.\n")
     return username, password
+
+
+def normalize_org_name(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", value).lower()
 
 
 class PreventSleep:
@@ -478,24 +481,57 @@ class Doc24Automation:
         page.wait_for_timeout(1800)
 
         rows = page.locator("tr:has(button:has-text('선택'))")
-        normalized_target = re.sub(r"\s+", "", recipient)
-        loose_match = None
+        row_count = rows.count()
+        self.log(f"수신기관 검색 결과 {row_count}건")
 
-        for index in range(rows.count()):
+        if row_count == 0:
+            debug = self._save_debug(f"수신기관 검색 결과 0건: {recipient}")
+            raise RuntimeError(f"수신기관 검색 결과가 없습니다. 디버그: {debug}")
+
+        candidates: list[tuple[object, str]] = []
+        for index in range(row_count):
             row = rows.nth(index)
             try:
-                raw = row.inner_text()
+                raw = " ".join(row.inner_text().split())
             except Exception:
+                raw = ""
+            if raw:
+                self.log(f"검색 후보 {index + 1}: {raw}")
+            candidates.append((row, raw))
+
+        target_normalized = normalize_org_name(recipient)
+        exact_matches = []
+        loose_matches = []
+
+        for row, raw in candidates:
+            row_normalized = normalize_org_name(raw)
+            if not row_normalized:
                 continue
-            normalized_row = re.sub(r"\s+", "", raw)
-            if normalized_target in normalized_row:
-                loose_match = row
-                break
+            if target_normalized == row_normalized:
+                exact_matches.append(row)
+            elif target_normalized in row_normalized:
+                loose_matches.append(row)
 
-        if loose_match is None:
-            raise RuntimeError("수신기관 검색 결과에서 일치하는 기관을 찾지 못했습니다.")
+        if len(exact_matches) == 1:
+            target_row = exact_matches[0]
+            self.log("수신기관 정확 일치 선택")
+        elif len(loose_matches) == 1:
+            target_row = loose_matches[0]
+            self.log("수신기관 이름 포함 일치 선택")
+        elif row_count == 1:
+            target_row = candidates[0][0]
+            self.log("검색 결과가 1건이라 해당 기관 선택")
+        else:
+            candidate_text = " | ".join(raw for _, raw in candidates if raw)
+            debug = self._save_debug(
+                f"수신기관 다중 결과 판단 실패\n검색어: {recipient}\n후보: {candidate_text}"
+            )
+            raise RuntimeError(
+                "수신기관 검색 결과가 여러 개라 자동 선택하지 않았습니다. "
+                f"후보를 확인해주세요. 디버그: {debug}"
+            )
 
-        loose_match.get_by_role("button", name="선택").click()
+        target_row.get_by_role("button", name="선택").click()
         page.wait_for_timeout(700)
 
     def resend_to(self, recipient: str, dry_run: bool) -> RecipientResult:
@@ -516,11 +552,13 @@ class Doc24Automation:
             page.wait_for_timeout(1800)
             return RecipientResult(recipient, "완료")
         except Exception as exc:
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return RecipientResult(recipient, "실패", str(exc))
+            debug = self._save_debug(f"수신기관 처리 실패: {recipient}\n{exc}")
+            if not dry_run:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            return RecipientResult(recipient, "실패", f"{exc} | 디버그: {debug}")
 
 
 def run() -> int:
@@ -577,6 +615,7 @@ def run() -> int:
 def smoke_test() -> int:
     assert parse_recipients("기관A\n기관B\n기관A") == ["기관A", "기관B"]
     assert parse_recipients("기관A, 기관B") == ["기관A", "기관B"]
+    assert normalize_org_name("전주 교육대학교-부설초등학교") == "전주교육대학교부설초등학교"
     sample = 'page.fill("#id", "example-user")\npage.keyboard.type("example-password", delay=100)'
     assert extract_legacy_credentials(sample) == ("example-user", "example-password")
     return 0
