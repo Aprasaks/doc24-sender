@@ -1,0 +1,43 @@
+name: Build macOS App
+
+on:
+  push:
+    branches:
+      - feat/macos-desktop-mvp
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Smoke test
+        run: python main.py --smoke-test
+
+      - name: Build macOS app
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name "Doc24Sender" \
+            --collect-all playwright \
+            main.py
+
+      - name: Zip app
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Doc24Sender.app Doc24Sender-macOS.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Doc24Sender-macOS
+          path: Doc24Sender-macOS.zip
