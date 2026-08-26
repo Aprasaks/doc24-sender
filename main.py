@@ -78,15 +78,26 @@ def load_recipients() -> list[str]:
     return recipients
 
 
-def save_results(results: list[RecipientResult]) -> Path:
+def save_results(results: list[RecipientResult]) -> tuple[Path, Path]:
     ensure_dirs()
-    output = RESULT_DIR / f"문서24_발송결과_{datetime.now():%Y%m%d_%H%M%S}.csv"
-    with output.open("w", encoding="utf-8-sig", newline="") as handle:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_path = RESULT_DIR / f"문서24_발송결과_{stamp}.csv"
+    failed_path = RESULT_DIR / f"문서24_반송목록_{stamp}.csv"
+
+    with result_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["수신기관", "상태", "사유"])
         for result in results:
             writer.writerow([result.recipient, result.status, result.reason])
-    return output
+
+    failures = [result for result in results if result.status == "실패"]
+    with failed_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["수신기관", "사유"])
+        for result in failures:
+            writer.writerow([result.recipient, result.reason])
+
+    return result_path, failed_path
 
 
 def load_local_credentials() -> tuple[str, str] | None:
@@ -391,6 +402,7 @@ class Doc24Automation:
         except Exception as exc:
             try:
                 page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
             except Exception:
                 pass
             return RecipientResult(school_name, "실패", str(exc))
@@ -416,29 +428,41 @@ def run() -> int:
                 return 0
 
         results: list[RecipientResult] = []
+        total = len(recipients)
+
         for index, school_name in enumerate(recipients, start=1):
-            log(f"[{index}/{len(recipients)}] {school_name} 작업 시작")
+            log(f"[{index}/{total}] {school_name} 작업 시작")
             result = automation.resend_to(school_name, dry_run)
             results.append(result)
 
             if result.status == "실패":
-                log(f"실패: {school_name} - {result.reason}")
+                log(f"반송/실패 기록: {school_name} - {result.reason}")
+                log("다음 기관으로 이동")
             elif result.status == "테스트":
                 log(f"테스트 성공: {school_name}")
             else:
                 log(f"발송 완료: {school_name}")
 
-        output = save_results(results)
+        result_path, failed_path = save_results(results)
         success = sum(1 for result in results if result.status != "실패")
         failed = sum(1 for result in results if result.status == "실패")
-        print(f"\n완료 {success} / 실패 {failed}")
-        print(f"결과 파일: {output}")
+
+        print("\n" + "=" * 70)
+        print(f"처리 완료: 성공 {success} / 반송·실패 {failed}")
+        print(f"전체 결과: {result_path}")
+        print(f"반송 목록: {failed_path}")
+        print("=" * 70)
 
     return 0
 
 
 def smoke_test() -> int:
     assert REGION_TERMS[0] == "전북특별자치도"
+    sample = [
+        RecipientResult("학교A", "완료"),
+        RecipientResult("학교B", "실패", "검색 결과 없음"),
+    ]
+    assert [item.recipient for item in sample if item.status == "실패"] == ["학교B"]
     return 0
 
 
