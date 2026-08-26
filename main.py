@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -13,10 +14,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from openpyxl import load_workbook
-from playwright.sync_api import Page, Playwright, sync_playwright
+from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
 DOC24_HOME = "https://docu.gdoc.go.kr/index.do"
 SENT_DOCS_URL = "https://docu.gdoc.go.kr/doc/snd/sendDocList.do"
+PROFILE_DIR = Path.home() / ".doc24_sender" / "chrome-profile"
+LOGIN_WAIT_SECONDS = 300
 
 
 @dataclass
@@ -80,15 +83,15 @@ def save_failures(results: list[RecipientResult]) -> Path | None:
 
 
 class Doc24Automation:
-    def __init__(self, username: str, password: str, log):
-        self.username = username
-        self.password = password
+    def __init__(self, log):
         self.log = log
         self.playwright: Playwright | None = None
-        self.browser = None
+        self.context: BrowserContext | None = None
         self.page: Page | None = None
+        self.caffeinate: subprocess.Popen | None = None
 
     def __enter__(self):
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         self.playwright = sync_playwright().start()
         chromium = self.playwright.chromium
 
@@ -97,44 +100,84 @@ class Doc24Automation:
             str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
         ]
         executable = next((path for path in chrome_paths if os.path.exists(path)), None)
+        if not executable:
+            raise RuntimeError("Google Chrome을 찾을 수 없습니다. 맥에 Google Chrome을 설치해주세요.")
 
         try:
-            if executable:
-                self.browser = chromium.launch(executable_path=executable, headless=False)
-            else:
-                self.browser = chromium.launch(channel="chrome", headless=False)
+            self.context = chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                executable_path=executable,
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+                args=["--no-first-run", "--no-default-browser-check"],
+            )
         except Exception as exc:
             raise RuntimeError(
-                "Google Chrome을 실행할 수 없습니다. 맥에 Google Chrome을 설치한 뒤 다시 실행해주세요."
+                "문서24 전용 Chrome을 실행할 수 없습니다. 이미 열려 있다면 닫고 다시 실행해주세요."
             ) from exc
 
-        self.page = self.browser.new_page(viewport={"width": 1280, "height": 900})
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+
+        # 자동화 중 맥이 잠자기 상태로 들어가지 않도록 유지한다.
+        try:
+            self.caffeinate = subprocess.Popen(
+                ["caffeinate", "-dimsu"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            self.caffeinate = None
+
         return self
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.browser:
-                self.browser.close()
+            if self.context:
+                self.context.close()
         finally:
             if self.playwright:
                 self.playwright.stop()
+            if self.caffeinate:
+                self.caffeinate.terminate()
+                self.caffeinate = None
 
-    def login(self) -> None:
+    def ensure_login(self) -> None:
         assert self.page is not None
         page = self.page
-        self.log("문서24 로그인 중...")
-        page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
-        page.get_by_text("로그인", exact=True).click()
-        page.wait_for_timeout(1200)
-        page.locator("#entrprsHref").click()
-        page.locator("#id").fill(self.username)
-        page.locator("#password").fill(self.password)
-        page.locator("#password").press("Enter")
-        page.wait_for_timeout(3500)
+        self.log("문서24 로그인 상태 확인 중...")
 
-        if "로그아웃" not in page.content():
-            raise RuntimeError("로그인에 실패했습니다. 아이디/비밀번호 또는 문서24 로그인 화면을 확인해주세요.")
-        self.log("로그인 성공")
+        page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1400)
+        if "로그아웃" in page.content():
+            self.log("저장된 로그인 세션으로 접속했습니다.")
+            return
+
+        self.log("로그인이 필요합니다. 열린 전용 Chrome에서 한 번만 로그인해주세요.")
+        page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(800)
+
+        try:
+            login_button = page.get_by_text("로그인", exact=True)
+            if login_button.count() and login_button.first.is_visible():
+                login_button.first.click()
+                page.wait_for_timeout(900)
+            corporate = page.locator("#entrprsHref")
+            if corporate.count() and corporate.is_visible():
+                corporate.click()
+        except Exception:
+            pass
+
+        deadline = time.monotonic() + LOGIN_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if "로그아웃" in page.content():
+                    self.log("로그인 확인 완료. 다음 실행부터 이 로그인 상태를 재사용합니다.")
+                    return
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+
+        raise RuntimeError("5분 안에 로그인이 확인되지 않았습니다. 다시 실행해주세요.")
 
     def get_last_document_title(self) -> str:
         assert self.page is not None
@@ -257,15 +300,13 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("문서24 재발송기")
-        self.root.geometry("780x720")
-        self.root.minsize(720, 620)
+        self.root.geometry("780x650")
+        self.root.minsize(720, 580)
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.preview_title = ""
         self.running = False
 
-        self.username = tk.StringVar()
-        self.password = tk.StringVar()
         self.actual_send = tk.BooleanVar(value=False)
         self.preview_text = tk.StringVar(value="마지막 전송문서를 먼저 확인해주세요.")
         self.status_text = tk.StringVar(value="대기 중")
@@ -280,19 +321,16 @@ class App:
         ttk.Label(outer, text="문서24 재발송기", font=("Helvetica", 22, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="마지막 전송문서를 그대로 재작성하여 여러 수신기관에 순차 발송합니다.",
-        ).pack(anchor="w", pady=(4, 18))
-
-        login = ttk.LabelFrame(outer, text="문서24 법인 계정", padding=12)
-        login.pack(fill="x")
-        ttk.Label(login, text="아이디").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(login, textvariable=self.username, width=34).grid(row=0, column=1, sticky="ew", pady=5)
-        ttk.Label(login, text="비밀번호").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(login, textvariable=self.password, show="●", width=34).grid(row=1, column=1, sticky="ew", pady=5)
-        login.columnconfigure(1, weight=1)
+            text="전용 Chrome 로그인 상태를 저장하고 마지막 전송문서를 여러 기관에 순차 재발송합니다.",
+        ).pack(anchor="w", pady=(4, 8))
+        ttk.Label(
+            outer,
+            text=f"로그인 프로필: {PROFILE_DIR}",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(0, 14))
 
         preview_frame = ttk.LabelFrame(outer, text="마지막 전송문서", padding=12)
-        preview_frame.pack(fill="x", pady=(14, 0))
+        preview_frame.pack(fill="x")
         ttk.Label(preview_frame, textvariable=self.preview_text, wraplength=610).pack(side="left", fill="x", expand=True)
         self.preview_button = ttk.Button(preview_frame, text="확인", command=self.preview_last_document)
         self.preview_button.pack(side="right", padx=(12, 0))
@@ -322,16 +360,8 @@ class App:
 
         log_frame = ttk.LabelFrame(outer, text="진행 로그", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(14, 0))
-        self.log_box = tk.Text(log_frame, height=10, state="disabled", wrap="word")
+        self.log_box = tk.Text(log_frame, height=9, state="disabled", wrap="word")
         self.log_box.pack(fill="both", expand=True)
-
-    def _credentials(self) -> tuple[str, str] | None:
-        username = self.username.get().strip()
-        password = self.password.get()
-        if not username or not password:
-            messagebox.showwarning("로그인 정보", "문서24 아이디와 비밀번호를 입력해주세요.")
-            return None
-        return username, password
 
     def import_recipients(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("수신기관 목록", "*.csv *.xlsx")])
@@ -347,16 +377,15 @@ class App:
         self._append_log(f"수신기관 {len(names)}개를 불러왔습니다.")
 
     def preview_last_document(self) -> None:
-        credentials = self._credentials()
-        if not credentials or self.running:
+        if self.running:
             return
         self._set_running(True, "마지막 문서 확인 중")
-        threading.Thread(target=self._preview_worker, args=credentials, daemon=True).start()
+        threading.Thread(target=self._preview_worker, daemon=True).start()
 
-    def _preview_worker(self, username: str, password: str) -> None:
+    def _preview_worker(self) -> None:
         try:
-            with Doc24Automation(username, password, self._thread_log) as automation:
-                automation.login()
+            with Doc24Automation(self._thread_log) as automation:
+                automation.ensure_login()
                 title = automation.get_last_document_title()
             self.events.put(("preview", title))
         except Exception as exc:
@@ -365,8 +394,7 @@ class App:
             self.events.put(("idle", "대기 중"))
 
     def start_sending(self) -> None:
-        credentials = self._credentials()
-        if not credentials or self.running:
+        if self.running:
             return
         if not self.preview_title:
             messagebox.showwarning("마지막 문서 확인", "먼저 [확인]을 눌러 마지막 전송문서를 확인해주세요.")
@@ -390,22 +418,20 @@ class App:
         self._set_running(True, f"{mode} 진행 중")
         threading.Thread(
             target=self._send_worker,
-            args=(*credentials, recipients, self.preview_title, self.actual_send.get()),
+            args=(recipients, self.preview_title, self.actual_send.get()),
             daemon=True,
         ).start()
 
     def _send_worker(
         self,
-        username: str,
-        password: str,
         recipients: list[str],
         expected_title: str,
         actual_send: bool,
     ) -> None:
         results: list[RecipientResult] = []
         try:
-            with Doc24Automation(username, password, self._thread_log) as automation:
-                automation.login()
+            with Doc24Automation(self._thread_log) as automation:
+                automation.ensure_login()
                 current_title = automation.get_last_document_title()
                 if current_title != expected_title:
                     raise RuntimeError(
@@ -484,6 +510,7 @@ class App:
 def smoke_test() -> int:
     assert parse_recipients("기관A\n기관B\n기관A") == ["기관A", "기관B"]
     assert parse_recipients("기관A, 기관B") == ["기관A", "기관B"]
+    assert PROFILE_DIR.name == "chrome-profile"
     return 0
 
 
