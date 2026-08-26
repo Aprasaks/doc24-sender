@@ -6,19 +6,20 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from getpass import getpass
 from pathlib import Path
 from typing import Callable
 
 from openpyxl import load_workbook
-from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
 DOC24_HOME = "https://docu.gdoc.go.kr/index.do"
 SENT_DOCS_URL = "https://docu.gdoc.go.kr/doc/snd/sendDocList.do"
 
 APP_DIR = Path.home() / ".doc24_sender"
-PROFILE_DIR = APP_DIR / "chrome-profile"
 CONFIG_PATH = APP_DIR / "config.json"
 RESULT_DIR = APP_DIR / "results"
 
@@ -41,7 +42,6 @@ def log(message: str) -> None:
 
 def ensure_app_dirs() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -66,29 +66,28 @@ def load_recipients() -> list[str]:
     source = next((path for path in candidates if path.exists()), None)
     if source is None:
         raise FileNotFoundError(
-            "수신기관 파일이 없습니다.\n"
-            "프로젝트 폴더에 school_list.xlsx, recipients.xlsx, recipients.csv, recipients.txt 중 하나를 넣어주세요."
+            "수신기관 파일이 없습니다. school_list.xlsx, recipients.xlsx, recipients.csv, recipients.txt 중 하나를 넣어주세요."
         )
 
-    if source.suffix.lower() == ".txt":
-        names = parse_recipients(source.read_text(encoding="utf-8-sig"))
-    elif source.suffix.lower() == ".csv":
-        values: list[str] = []
+    values: list[str] = []
+    suffix = source.suffix.lower()
+
+    if suffix == ".txt":
+        values = source.read_text(encoding="utf-8-sig").splitlines()
+    elif suffix == ".csv":
         with source.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.reader(handle):
-                if row and str(row[0]).strip():
+                if row and row[0] is not None:
                     values.append(str(row[0]).strip())
-        names = parse_recipients("\n".join(values))
     else:
         workbook = load_workbook(source, read_only=True, data_only=True)
         sheet = workbook.active
-        values = []
         for row in sheet.iter_rows(values_only=True):
             if row and row[0] is not None:
                 values.append(str(row[0]).strip())
         workbook.close()
-        names = parse_recipients("\n".join(values))
 
+    names = parse_recipients("\n".join(values))
     if names and names[0].replace(" ", "") in {"학교명", "기관명", "수신기관", "수신자"}:
         names = names[1:]
 
@@ -155,22 +154,24 @@ def extract_legacy_credentials(source: str) -> tuple[str, str] | None:
         (match.group(1) for pattern in pw_patterns if (match := re.search(pattern, source))),
         None,
     )
-
     if username and password:
         return username, password
     return None
 
 
 def migrate_legacy_credentials() -> tuple[str, str] | None:
-    if CONFIG_PATH.exists():
-        return load_local_credentials()
+    sources: list[str] = []
 
-    legacy_sources: list[str] = []
-
-    for path in [Path("legacy_main.py"), Path("main_old.py"), Path("old_main.py")]:
+    candidates = [
+        Path.home() / "Desktop" / "doc24-main-backup.py",
+        Path("legacy_main.py"),
+        Path("main_old.py"),
+        Path("old_main.py"),
+    ]
+    for path in candidates:
         if path.exists():
             try:
-                legacy_sources.append(path.read_text(encoding="utf-8"))
+                sources.append(path.read_text(encoding="utf-8"))
             except Exception:
                 pass
 
@@ -183,18 +184,32 @@ def migrate_legacy_credentials() -> tuple[str, str] | None:
             timeout=10,
         )
         if completed.stdout:
-            legacy_sources.append(completed.stdout)
+            sources.append(completed.stdout)
     except Exception:
         pass
 
-    for source in legacy_sources:
+    for source in sources:
         credentials = extract_legacy_credentials(source)
         if credentials:
             save_local_credentials(*credentials)
-            log("기존 코드의 로그인 정보를 맥 로컬 설정으로 이전했습니다.")
+            log("기존 코드의 로그인 정보를 맥 로컬 설정으로 저장했습니다.")
             return credentials
-
     return None
+
+
+def get_credentials() -> tuple[str, str]:
+    credentials = load_local_credentials() or migrate_legacy_credentials()
+    if credentials:
+        return credentials
+
+    print("\n문서24 로그인 정보가 아직 로컬에 저장되어 있지 않습니다.")
+    username = input("아이디: ").strip()
+    password = getpass("비밀번호: ")
+    if not username or not password:
+        raise RuntimeError("아이디 또는 비밀번호가 비어 있습니다.")
+    save_local_credentials(username, password)
+    print("로그인 정보를 이 맥의 ~/.doc24_sender/config.json 에 저장했습니다.\n")
+    return username, password
 
 
 class PreventSleep:
@@ -225,6 +240,7 @@ class Doc24Automation:
     def __init__(self, logger: Callable[[str], None] = log):
         self.log = logger
         self.playwright: Playwright | None = None
+        self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
 
@@ -235,74 +251,75 @@ class Doc24Automation:
         if not chrome_path:
             raise RuntimeError("Google Chrome을 찾지 못했습니다. /Applications에 Chrome을 설치해주세요.")
 
-        self.context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+        self.browser = self.playwright.chromium.launch(
             executable_path=chrome_path,
             headless=False,
-            viewport={"width": 1280, "height": 900},
-            args=["--disable-notifications"],
         )
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        self.context = self.browser.new_context(viewport={"width": 1280, "height": 900})
+        self.page = self.context.new_page()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and sys.stdin.isatty():
+            print("\n오류가 발생했습니다. 현재 Chrome 화면을 확인하세요.")
+            try:
+                input("확인 후 Enter를 누르면 Chrome을 닫습니다: ")
+            except Exception:
+                pass
         try:
             if self.context is not None:
                 self.context.close()
+            if self.browser is not None:
+                self.browser.close()
         finally:
             if self.playwright is not None:
                 self.playwright.stop()
 
-    def _is_logged_in(self) -> bool:
+    def _login_successful(self) -> bool:
         assert self.page is not None
-        page = self.page
         try:
-            page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1200)
+            return "로그아웃" in self.page.content()
         except Exception:
             return False
-        content = page.content()
-        return "로그아웃" in content and "보낸 문서" in content
 
     def ensure_login(self) -> None:
         assert self.page is not None
-        if self._is_logged_in():
-            self.log("저장된 문서24 로그인 세션 사용")
-            return
-
-        credentials = load_local_credentials() or migrate_legacy_credentials()
         page = self.page
+        username, password = get_credentials()
 
-        if credentials:
-            username, password = credentials
-            self.log("저장된 로컬 계정정보로 문서24 로그인 시도")
-            page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
-            page.get_by_text("로그인", exact=True).click()
-            page.wait_for_timeout(1000)
-            page.locator("#entrprsHref").click()
-            page.locator("#id").fill(username)
-            page.locator("#password").fill(password)
-            page.locator("#password").press("Enter")
-            page.wait_for_timeout(3000)
-
-            if self._is_logged_in():
-                self.log("자동 로그인 성공")
-                return
-            self.log("자동 로그인 실패. 전용 Chrome에서 직접 로그인해주세요.")
-
+        self.log("문서24 로그인 페이지 이동")
         page.goto(DOC24_HOME, wait_until="domcontentloaded", timeout=30000)
-        print("\n문서24 전용 Chrome에서 로그인해주세요.")
-        print("로그인 완료 후 이 터미널로 돌아와 Enter를 누르세요.\n")
-        input()
-        if not self._is_logged_in():
-            raise RuntimeError("문서24 로그인 상태를 확인하지 못했습니다.")
-        self.log("로그인 확인 완료. 다음 실행부터 이 Chrome 세션을 재사용합니다.")
 
-    def _save_last_document_debug(self, reason: str) -> Path:
+        self.log("로그인 메뉴 선택")
+        page.get_by_text("로그인", exact=True).click()
+        page.wait_for_timeout(1200)
+
+        self.log("법인 계정 선택")
+        page.locator("#entrprsHref").click()
+        page.wait_for_timeout(500)
+
+        self.log("아이디 입력")
+        page.locator("#id").fill(username)
+
+        self.log("비밀번호 입력")
+        page.locator("#password").fill(password)
+
+        self.log("로그인 실행")
+        page.locator("#password").press("Enter")
+
+        for _ in range(20):
+            page.wait_for_timeout(500)
+            if self._login_successful():
+                self.log("로그인 성공")
+                return
+
+        raise RuntimeError("문서24 로그인에 실패했습니다. 아이디/비밀번호 또는 로그인 화면을 확인해주세요.")
+
+    def _save_debug(self, reason: str) -> Path:
         assert self.page is not None
         ensure_app_dirs()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix = RESULT_DIR / f"last_document_debug_{stamp}"
+        prefix = RESULT_DIR / f"debug_{stamp}"
         try:
             self.page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True)
         except Exception:
@@ -321,74 +338,68 @@ class Doc24Automation:
         assert self.page is not None
         page = self.page
         rows = page.locator("tbody tr")
-        row_count = rows.count()
-        if row_count == 0:
-            debug = self._save_last_document_debug("tbody tr이 없습니다.")
-            raise RuntimeError(f"보낸 문서함에서 문서 행을 찾지 못했습니다. 디버그: {debug}")
+        count = rows.count()
+        notes: list[str] = []
 
-        row_logs: list[str] = []
-        for index in range(row_count):
+        for index in range(count):
             row = rows.nth(index)
             try:
                 row_text = " ".join(row.inner_text().split())
             except Exception:
                 row_text = ""
 
-            if row_text:
-                row_logs.append(f"row {index}: {row_text[:300]}")
-
             if not row_text:
                 continue
-            if any(message in row_text for message in ["조회된 데이터가 없습니다", "검색 결과가 없습니다"]):
+            notes.append(f"row {index}: {row_text[:300]}")
+
+            if "조회된 데이터가 없습니다" in row_text or "검색 결과가 없습니다" in row_text:
                 continue
 
-            selectors = ["a", "button", "[onclick]", "[role='button']"]
-            for selector in selectors:
-                candidates = row.locator(selector)
-                for candidate_index in range(candidates.count()):
-                    candidate = candidates.nth(candidate_index)
-                    try:
-                        text = " ".join(candidate.inner_text().split())
-                    except Exception:
-                        text = ""
-                    try:
-                        visible = candidate.is_visible()
-                    except Exception:
-                        visible = False
+            anchors = row.locator("a")
+            for anchor_index in range(anchors.count()):
+                anchor = anchors.nth(anchor_index)
+                try:
+                    text = " ".join(anchor.inner_text().split())
+                except Exception:
+                    text = ""
+                if text:
+                    return row, anchor, text
 
-                    # 문서 제목은 보통 텍스트가 있는 클릭 요소다.
-                    if visible and text and text not in {"보기", "상세", "다운로드", "삭제"}:
-                        return row, candidate, text
+            if anchors.count() > 0:
+                return row, anchors.first, row_text
 
-            # 행 자체에 onclick이 걸린 구조도 허용한다.
+            clickable = row.locator("[onclick]")
+            if clickable.count() > 0:
+                target = clickable.first
+                try:
+                    text = " ".join(target.inner_text().split())
+                except Exception:
+                    text = row_text
+                return row, target, text or row_text
+
             try:
                 if row.get_attribute("onclick"):
                     return row, row, row_text
             except Exception:
                 pass
 
-        # 클릭요소를 못 찾더라도 첫 번째 실제 데이터 행 텍스트는 진단에 남긴다.
-        reason = "\n".join(row_logs[:10]) or "행 텍스트도 읽지 못했습니다."
-        debug = self._save_last_document_debug(reason)
-        raise RuntimeError(
-            "마지막 전송문서의 클릭 요소를 찾지 못했습니다. "
-            f"디버그 파일이 저장되었습니다: {debug}"
-        )
+        reason = "\n".join(notes[:15]) or "보낸 문서함 행을 읽지 못했습니다."
+        debug = self._save_debug(reason)
+        raise RuntimeError(f"마지막 전송문서를 찾지 못했습니다. 디버그: {debug}")
 
     def get_last_document_title(self) -> str:
         assert self.page is not None
         page = self.page
+        self.log("보낸 문서함 이동")
         page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1800)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
 
-        row, target, title = self._find_latest_document()
-        if title:
-            return title
-
-        row_text = " ".join(row.inner_text().split())
-        if row_text:
-            return row_text
-        raise RuntimeError("마지막 전송문서 제목을 읽지 못했습니다.")
+        _, _, title = self._find_latest_document()
+        return title
 
     def _click_dialog_button(self, label: str) -> None:
         assert self.page is not None
@@ -412,35 +423,40 @@ class Doc24Automation:
         page = self.page
 
         page.goto(SENT_DOCS_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1800)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
 
         _, target, _ = self._find_latest_document()
         target.click(force=True)
-        page.wait_for_timeout(1600)
+        page.wait_for_timeout(2500)
 
-        rewrite_button = page.locator("button:has-text('재작성')")
-        if rewrite_button.count() == 0:
-            debug = self._save_last_document_debug("문서 상세 진입 후 재작성 버튼이 없습니다.")
+        rewrite = page.locator("button:has-text('재작성')")
+        if rewrite.count() == 0:
+            debug = self._save_debug("재작성 버튼을 찾지 못했습니다.")
             raise RuntimeError(f"재작성 버튼을 찾지 못했습니다. 디버그: {debug}")
-        rewrite_button.first.click(force=True)
-        page.wait_for_timeout(700)
+        rewrite.first.click(force=True)
+        page.wait_for_timeout(1000)
+
         self._click_dialog_button("예")
-        page.wait_for_timeout(1400)
+        page.wait_for_timeout(1800)
 
         for index in range(1, 5):
             checkbox = page.locator(f"label[for='wteChk{index}']")
             try:
                 if checkbox.count() and checkbox.is_visible():
                     checkbox.click()
-                    page.wait_for_timeout(120)
+                    page.wait_for_timeout(200)
             except Exception:
                 pass
 
         confirm = page.get_by_role("button", name="확인")
         try:
-            if confirm.count() and confirm.last.is_visible(timeout=700):
+            if confirm.count() and confirm.last.is_visible(timeout=1000):
                 confirm.last.click()
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(800)
         except Exception:
             pass
 
@@ -449,7 +465,7 @@ class Doc24Automation:
         page = self.page
 
         page.locator("#ldapSearch").click()
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1500)
 
         search_box = page.locator("#searchOrgNm")
         search_box.fill(recipient)
@@ -459,12 +475,10 @@ class Doc24Automation:
             search_button.last.click()
         else:
             page.locator("button[type='submit']").last.click()
-
-        page.wait_for_timeout(1400)
+        page.wait_for_timeout(1800)
 
         rows = page.locator("tr:has(button:has-text('선택'))")
         normalized_target = re.sub(r"\s+", "", recipient)
-        exact_match = None
         loose_match = None
 
         for index in range(rows.count()):
@@ -474,19 +488,15 @@ class Doc24Automation:
             except Exception:
                 continue
             normalized_row = re.sub(r"\s+", "", raw)
-
-            if normalized_target == normalized_row or normalized_row.startswith(normalized_target):
-                exact_match = row
-                break
-            if normalized_target in normalized_row and loose_match is None:
+            if normalized_target in normalized_row:
                 loose_match = row
+                break
 
-        target = exact_match or loose_match
-        if target is None:
+        if loose_match is None:
             raise RuntimeError("수신기관 검색 결과에서 일치하는 기관을 찾지 못했습니다.")
 
-        target.get_by_role("button", name="선택").click()
-        page.wait_for_timeout(600)
+        loose_match.get_by_role("button", name="선택").click()
+        page.wait_for_timeout(700)
 
     def resend_to(self, recipient: str, dry_run: bool) -> RecipientResult:
         assert self.page is not None
@@ -499,11 +509,11 @@ class Doc24Automation:
                 return RecipientResult(recipient, "테스트", "수신기관 검색/선택 성공")
 
             page.locator("#sendDoc").click()
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(800)
             self._click_dialog_button("보내기")
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(800)
             self._click_dialog_button("예")
-            page.wait_for_timeout(1600)
+            page.wait_for_timeout(1800)
             return RecipientResult(recipient, "완료")
         except Exception as exc:
             try:
@@ -567,7 +577,6 @@ def run() -> int:
 def smoke_test() -> int:
     assert parse_recipients("기관A\n기관B\n기관A") == ["기관A", "기관B"]
     assert parse_recipients("기관A, 기관B") == ["기관A", "기관B"]
-
     sample = 'page.fill("#id", "example-user")\npage.keyboard.type("example-password", delay=100)'
     assert extract_legacy_credentials(sample) == ("example-user", "example-password")
     return 0
